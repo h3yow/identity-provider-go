@@ -25,6 +25,8 @@ const (
 	ErrRefreshReplayed    ErrorCode = "refresh_replayed"
 	ErrRefreshExpired     ErrorCode = "refresh_expired"
 	ErrConcurrentRefresh  ErrorCode = "concurrent_refresh"
+	ErrSessionRevoked     ErrorCode = "session_revoked"
+	ErrSessionLimit       ErrorCode = "session_limit_exceeded"
 )
 
 // Error is a classified authentication error.

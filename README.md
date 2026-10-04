@@ -74,7 +74,57 @@ CreatedAt + ExpiresAt + RetireAt` 描述，在任意时刻处于以下三态之�
   `concurrent_refresh` 且不改变任何状态；提交阶段会在锁内二次校验，防止准备期间
   链被其他重放终止。测试用 32/16 goroutine + `-race` 验证无分叉、无重复会话。
 
-## 3. 鉴权模型
+## 3. 会话终止与容量上限
+
+访问令牌在签发时通过 `cid` claim 绑定所属会话链（`tokens.Claims.ChainID`），因此
+链一旦被终止，**链上已签发的访问令牌立即失效**（`Authenticate` 在校验签名之后、
+返回 claims 之前检查链状态），结论为 `session_revoked`。
+
+### 主动登出（`Logout` / `POST /logout`）
+
+凭**任意一个属于该链的刷新凭据**（包括登录时最初下发的那个）即可结束整条链：
+
+| 输入情形               | 结论                | 状态影响 |
+|------------------------|---------------------|----------|
+| 凭据不存在/为空         | `refresh_not_found` | 无       |
+| 链上任意凭据            | 成功，整链撤销       | 链终止   |
+| 链已终止（重复登出）     | **幂等成功**，不报错 | 无       |
+
+登出后链上任何凭据再刷新都得到固定的 `session_revoked`——与「凭据从来没出现过」
+的 `refresh_not_found` 明确区分；同一主体的其他链不受影响。
+
+### 按主体终止（`TerminateSubject` / `POST /terminate`）
+
+一次性撤销某主体当前所有存活链，返回本次终止的链数。并发语义是确定的：
+
+- 整个终止在状态锁内原子完成；`Refresh` 的提交阶段在同一把锁内二次校验链状态。
+  因此**终止返回后，该主体名下不可能再有刷新成功**，在终止进行中的刷新要么已经
+  提交（属于被终止的历史），要么在提交时发现链已撤销而失败——不存在「终止完成了
+  但某个并发请求又把链路续上」的窗口，结论不随 goroutine 调度变化。
+- 终止不封禁主体：之后可以重新登录建立新链。
+- 测试（`TestTerminateRacesWithRefresh`）用 8 条链并发狂刷 + 中途终止验证：终止
+  返回时快照的链会话数之后不再变化（不多不少），所有最新凭据刷新均为
+  `session_revoked`。
+
+### 每主体活跃链上限（`Options.MaxChainsPerSubject`）
+
+- 上限只统计**存活**链；`<= 0` 表示不限。
+- 达到上限后登录被明确拒绝：`session_limit_exceeded`（HTTP 429），与凭证错误、
+  重放等其他失败原因可区分。
+- 登出或按主体终止后配额**立即**腾出，可以重新登录。
+- 容量检查与占用在同一临界区内完成：16 并发登录抢 cap=4 时恰好 4 个成功；
+  登出与登录混合并发时，最终存活链数严格等于「成功登录数 − 成功登出数」，
+  绝不超过上限（`TestConcurrentLoginLogoutRespectsCap`）。
+
+### 兼容范围
+
+- 访问令牌新增 `cid`（链 ID）claim，带 `omitempty`：本服务签发的令牌都携带；
+  不含 `cid` 的旧格式令牌仍按原规则验签，只是不参与「链终止即失效」判定。
+- 原有结论不变：重放终止链仍报 `refresh_replayed`，未知凭据仍报
+  `refresh_not_found`；登出/按主体终止的链统一报 `session_revoked`，三者可区分。
+- `Options.MaxChainsPerSubject <= 0`（默认）行为与上一版完全一致（不限链数）。
+
+## 4. 鉴权模型
 
 `authz.Policy` 维护 `角色 -> 作用域集合`；令牌携带 `roles` 与 `scopes`，请求可
 声明所需角色与作用域。鉴权结论是**四值**的，严格区分「你是谁无法确认」与
@@ -92,18 +142,20 @@ CreatedAt + ExpiresAt + RetireAt` 描述，在任意时刻处于以下三态之�
 都有测试）。判定过程无惰性读写，并发请求下结论稳定（见
 `TestConcurrentDecisionsStable`）。
 
-## 4. HTTP API
+## 5. HTTP API
 
 `cmd/idp` 启动后监听 `:8080`（可用 `IDP_ADDR` 覆盖），所有接口均为 `POST` JSON：
 
-- `POST /login`   `{subject, roles?, scopes?}` → `access_token, refresh_token, key_id, ...`
+- `POST /login`   `{subject, roles?, scopes?}` → `access_token, refresh_token, key_id, ...`；超出每主体链上限时 429 `session_limit_exceeded`
 - `POST /refresh` `{refresh_token}` → 轮换后的新令牌对
-- `POST /verify`  `{access_token}` → 令牌 claims，或带错误码的 401
+- `POST /logout`  `{refresh_token}` → `{"terminated":true}`；幂等，未知凭据 401 `refresh_not_found`
+- `POST /terminate` `{subject}` → `{"terminated_chains":N}`，终止该主体全部存活链
+- `POST /verify`  `{access_token}` → 令牌 claims，或带错误码的 401（链已终止时为 `session_revoked`）
 - `POST /authz`   `{access_token, roles?, scopes?}` → `{decision:"allow",...}` 或 401/403
 
 错误响应统一形如 `{"error":"<code>","reason":"<可解释原因>"}`。
 
-## 5. 本地验证
+## 6. 本地验证
 
 ```bash
 # 运行全部测试（含竞态检测）
@@ -112,9 +164,9 @@ go test ./... -race -v
 # 只看关键场景
 go test ./internal/keys/  -v   # 轮换、active/grace/retired 三态
 go test ./internal/tokens/ -v # 多版本共存、宽限、过期/签名/未知/退役区分
-go test ./internal/auth/  -v   # 一次性轮换、重放终止链、32 并发单赢家
+go test ./internal/auth/  -v   # 一次性轮换、重放终止链、登出/按主体终止、容量上限、并发竞争
 go test ./internal/authz/ -v   # 四值判定、权限不扩散、并发稳定
-go test ./internal/server/ -v  # HTTP 端到端、401/403 区分
+go test ./internal/server/ -v  # HTTP 端到端、401/403/429 区分
 
 # 启动服务并手工验证
 go run ./cmd/idp
@@ -136,6 +188,18 @@ curl -s -XPOST $BASE/authz  -d '{}'                                             
 
 NEW=$(curl -s -XPOST $BASE/refresh -d "{\"refresh_token\":\"$RT\"}")
 curl -i -XPOST $BASE/refresh -d "{\"refresh_token\":\"$RT\"}"   # 401 refresh_replayed，链路终止
+
+# 登出：用最初下发的刷新凭据结束当前链（幂等）
+RT2=$(echo "$NEW" | jq -r .refresh_token)
+AT2=$(echo "$NEW" | jq -r .access_token)
+curl -s -XPOST $BASE/logout -d "{\"refresh_token\":\"$RT2\"}"          # {"terminated":true}
+curl -s -XPOST $BASE/verify -d "{\"access_token\":\"$AT2\"}"           # 401 session_revoked
+curl -s -XPOST $BASE/refresh -d "{\"refresh_token\":\"$RT2\"}"         # 401 session_revoked
+curl -s -XPOST $BASE/logout -d "{\"refresh_token\":\"$RT2\"}"          # 仍是 200（幂等）
+
+# 按主体一次性终止：该主体所有存活链立即失效
+curl -s -XPOST $BASE/login -d '{"subject":"alice"}' >/dev/null
+curl -s -XPOST $BASE/terminate -d '{"subject":"alice"}'                # {"terminated_chains":N}
 ```
 
 服务端日志（stdout）与 `go test -v` 都会打印**关键输入与判定依据**：密钥版本、

@@ -18,6 +18,11 @@ import (
 
 func newTestServer(t *testing.T) (*Server, *keys.KeyRing, time.Time) {
 	t.Helper()
+	return newTestServerCap(t, 0)
+}
+
+func newTestServerCap(t *testing.T, cap int) (*Server, *keys.KeyRing, time.Time) {
+	t.Helper()
 	t0 := time.Date(2026, 9, 25, 10, 0, 0, 0, time.UTC)
 	now := t0
 	r := keys.NewKeyRing()
@@ -27,7 +32,8 @@ func newTestServer(t *testing.T) (*Server, *keys.KeyRing, time.Time) {
 	logger := log.New(os.Stdout, "  [httptest] ", log.LstdFlags|log.Lmicroseconds)
 	signer := tokens.NewSigner(r)
 	authn := auth.NewService(signer, auth.Options{
-		AccessTokenTTL: 30 * time.Minute, RefreshTokenTTL: 2 * time.Hour, Logger: logger,
+		AccessTokenTTL: 30 * time.Minute, RefreshTokenTTL: 2 * time.Hour,
+		MaxChainsPerSubject: cap, Logger: logger,
 	})
 	pol := authz.NewPolicy()
 	pol.Grant("viewer", "read")
@@ -183,4 +189,112 @@ func TestHTTPKeyRotationDistinctions(t *testing.T) {
 	if _, err := tokens.NewSigner(ring).Verify(oldAccess, t0.Add(15*time.Minute)); err != nil {
 		t.Fatalf("old token should verify during k1 grace: %v", err)
 	}
+}
+
+// Logout over HTTP: the chain dies at once (verify + refresh both refuse
+// with session_revoked), repeats are idempotent 200s, unknown credentials
+// stay refresh_not_found.
+func TestHTTPLogout(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	h := srv.Handler()
+
+	st, login := post(t, h, "/login", map[string]any{"subject": "nora", "scopes": []string{"read"}})
+	if st != 200 {
+		t.Fatalf("login status = %d", st)
+	}
+	access, _ := login["access_token"].(string)
+	refresh, _ := login["refresh_token"].(string)
+
+	st, out := post(t, h, "/logout", map[string]any{"refresh_token": refresh})
+	if st != 200 || out["terminated"] != true {
+		t.Fatalf("logout => %d %v, want 200 terminated=true", st, out)
+	}
+
+	st, out = post(t, h, "/verify", map[string]any{"access_token": access})
+	if st != http.StatusUnauthorized || out["error"] != "session_revoked" {
+		t.Fatalf("verify after logout => %d %v, want 401 session_revoked", st, out)
+	}
+	st, out = post(t, h, "/refresh", map[string]any{"refresh_token": refresh})
+	if st != http.StatusUnauthorized || out["error"] != "session_revoked" {
+		t.Fatalf("refresh after logout => %d %v, want 401 session_revoked", st, out)
+	}
+
+	// Idempotent repeat.
+	if st, _ := post(t, h, "/logout", map[string]any{"refresh_token": refresh}); st != 200 {
+		t.Fatalf("repeated logout must be idempotent 200, got %d", st)
+	}
+	// Unknown credential is a different, fixed conclusion.
+	st, out = post(t, h, "/logout", map[string]any{"refresh_token": "never-issued"})
+	if st != http.StatusUnauthorized || out["error"] != "refresh_not_found" {
+		t.Fatalf("logout unknown => %d %v, want 401 refresh_not_found", st, out)
+	}
+	t.Logf("logout semantics over HTTP: terminated=true; verify/refresh => session_revoked; repeat idempotent; unknown => refresh_not_found")
+}
+
+// Terminate over HTTP: every chain of the subject dies, other subjects are
+// untouched, and the login cap (429) is distinguishable from other failures.
+func TestHTTPTerminateAndCapacity(t *testing.T) {
+	srv, _, t0 := newTestServer(t)
+	h := srv.Handler()
+	_ = t0
+
+	// Two chains for olivia, one for pete.
+	var oliviaRefresh []string
+	for i := 0; i < 2; i++ {
+		st, login := post(t, h, "/login", map[string]any{"subject": "olivia"})
+		if st != 200 {
+			t.Fatalf("login %d status = %d", i, st)
+		}
+		rt, _ := login["refresh_token"].(string)
+		oliviaRefresh = append(oliviaRefresh, rt)
+	}
+	st, pete := post(t, h, "/login", map[string]any{"subject": "pete"})
+	if st != 200 {
+		t.Fatalf("pete login status = %d", st)
+	}
+	peteRefresh, _ := pete["refresh_token"].(string)
+
+	st, out := post(t, h, "/terminate", map[string]any{"subject": "olivia"})
+	if st != 200 || out["terminated_chains"] != float64(2) {
+		t.Fatalf("terminate => %d %v, want 200 terminated_chains=2", st, out)
+	}
+	for _, rt := range oliviaRefresh {
+		st, out := post(t, h, "/refresh", map[string]any{"refresh_token": rt})
+		if st != http.StatusUnauthorized || out["error"] != "session_revoked" {
+			t.Fatalf("olivia refresh after terminate => %d %v, want 401 session_revoked", st, out)
+		}
+	}
+	// Pete's chain is unaffected.
+	if st, _ := post(t, h, "/refresh", map[string]any{"refresh_token": peteRefresh}); st != 200 {
+		t.Fatalf("pete refresh after olivia terminated => %d, want 200", st)
+	}
+	t.Logf("terminate over HTTP: olivia 2 chains => session_revoked; pete unaffected")
+}
+
+// Login beyond the per-subject cap is a 429 with its own code, and logout
+// frees the slot again.
+func TestHTTPLoginCapExceeded(t *testing.T) {
+	srv, _, _ := newTestServerCap(t, 1)
+	h := srv.Handler()
+
+	st, login := post(t, h, "/login", map[string]any{"subject": "quinn"})
+	if st != 200 {
+		t.Fatalf("first login status = %d", st)
+	}
+	refresh, _ := login["refresh_token"].(string)
+
+	st, out := post(t, h, "/login", map[string]any{"subject": "quinn"})
+	if st != http.StatusTooManyRequests || out["error"] != "session_limit_exceeded" {
+		t.Fatalf("second login at cap=1 => %d %v, want 429 session_limit_exceeded", st, out)
+	}
+	t.Logf("cap=1: second login => 429 session_limit_exceeded (distinct from 401 causes)")
+
+	// Logging out the live chain frees the slot.
+	if st, _ := post(t, h, "/logout", map[string]any{"refresh_token": refresh}); st != 200 {
+		t.Fatalf("logout status = %d", st)
+	}
+	if st, _ := post(t, h, "/login", map[string]any{"subject": "quinn"}); st != 200 {
+		t.Fatalf("login after logout freed the slot => %d, want 200", st)
+	}
+	t.Logf("logout freed the slot: login accepted again")
 }

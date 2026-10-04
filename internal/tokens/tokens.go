@@ -56,6 +56,10 @@ type Claims struct {
 	Scopes    []string
 	IssuedAt  time.Time
 	ExpiresAt time.Time
+	// ChainID binds the token to the session chain that issued it, so the
+	// caller can invalidate already-issued tokens when the chain ends.
+	// Empty means the token is not bound to any chain.
+	ChainID string
 }
 
 // Token is a signed token plus the key version that signed it.
@@ -92,6 +96,7 @@ type wireClaims struct {
 	Scp   []string `json:"scp"`
 	Iat   int64    `json:"iat"`
 	Exp   int64    `json:"exp"`
+	Cid   string   `json:"cid,omitempty"`
 }
 
 var b64 = base64.RawURLEncoding
@@ -110,6 +115,7 @@ func (s *Signer) Sign(c Claims, now time.Time) (*Token, error) {
 		Sub: c.Subject, Roles: append([]string(nil), c.Roles...),
 		Scp: append([]string(nil), c.Scopes...),
 		Iat: c.IssuedAt.Unix(), Exp: c.ExpiresAt.Unix(),
+		Cid: c.ChainID,
 	}
 	hb, err := json.Marshal(hdr)
 	if err != nil {
@@ -190,6 +196,7 @@ func (s *Signer) Verify(raw string, now time.Time) (*Claims, error) {
 		Subject: body.Sub, Roles: body.Roles, Scopes: body.Scp,
 		IssuedAt:  time.Unix(body.Iat, 0).UTC(),
 		ExpiresAt: time.Unix(body.Exp, 0).UTC(),
+		ChainID:   body.Cid,
 	}
 	if !now.Before(claims.ExpiresAt) {
 		return nil, tokenError(ErrTokenExpired, "token for %q expired at %s",

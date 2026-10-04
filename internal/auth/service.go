@@ -12,11 +12,15 @@ type Logger interface {
 	Printf(format string, args ...any)
 }
 
-// Options holds token lifetimes and an optional logger.
+// Options holds token lifetimes, the per-subject chain capacity and an
+// optional logger.
 type Options struct {
 	AccessTokenTTL  time.Duration
 	RefreshTokenTTL time.Duration
-	Logger          Logger
+	// MaxChainsPerSubject caps the number of simultaneously live session
+	// chains one subject may hold. <= 0 means unlimited.
+	MaxChainsPerSubject int
+	Logger              Logger
 }
 
 func (o Options) withDefaults() Options {
@@ -62,17 +66,25 @@ type Service struct {
 	opts      Options
 	byRefresh map[string]*Session // includes consumed credentials, for replay detection
 	chains    map[string][]*Session
-	inflight  map[string]struct{} // refresh credentials currently being rotated
+	// termCode records why a chain was terminated, so later refreshes on it
+	// get a cause-specific code (replay vs. logout vs. subject termination).
+	termCode map[string]ErrorCode
+	// subjectChains indexes chain IDs by subject for per-subject termination
+	// and capacity accounting.
+	subjectChains map[string]map[string]struct{}
+	inflight      map[string]struct{} // refresh credentials currently being rotated
 }
 
 // NewService builds an in-process authentication service.
 func NewService(signer *tokens.Signer, opts Options) *Service {
 	return &Service{
-		signer:    signer,
-		opts:      opts.withDefaults(),
-		byRefresh: make(map[string]*Session),
-		chains:    make(map[string][]*Session),
-		inflight:  make(map[string]struct{}),
+		signer:        signer,
+		opts:          opts.withDefaults(),
+		byRefresh:     make(map[string]*Session),
+		chains:        make(map[string][]*Session),
+		termCode:      make(map[string]ErrorCode),
+		subjectChains: make(map[string]map[string]struct{}),
+		inflight:      make(map[string]struct{}),
 	}
 }
 
@@ -104,13 +116,35 @@ func (s *Service) Login(subject string, roles, scopes []string, now time.Time) (
 	tok, err := s.signer.Sign(tokens.Claims{
 		Subject: subject, Roles: roles, Scopes: scopes,
 		IssuedAt: now, ExpiresAt: now.Add(s.opts.AccessTokenTTL),
+		ChainID: chainID,
 	}, now)
 	if err != nil {
 		return nil, MapTokenError(err)
 	}
 	s.mu.Lock()
+	if s.opts.MaxChainsPerSubject > 0 {
+		active := 0
+		for id := range s.subjectChains[subject] {
+			if !s.chainRevokedLocked(id) {
+				active++
+			}
+		}
+		if active >= s.opts.MaxChainsPerSubject {
+			s.mu.Unlock()
+			if s.opts.Logger != nil {
+				s.opts.Logger.Printf("login: subject=%s => denied session_limit_exceeded (active=%d cap=%d)",
+					subject, active, s.opts.MaxChainsPerSubject)
+			}
+			return nil, newError(ErrSessionLimit,
+				"subject already holds %d live session chains (cap %d)", active, s.opts.MaxChainsPerSubject)
+		}
+	}
 	s.byRefresh[refresh] = sess
 	s.chains[chainID] = []*Session{sess}
+	if s.subjectChains[subject] == nil {
+		s.subjectChains[subject] = make(map[string]struct{})
+	}
+	s.subjectChains[subject][chainID] = struct{}{}
 	s.mu.Unlock()
 	if s.opts.Logger != nil {
 		s.opts.Logger.Printf("login: subject=%s roles=%v scopes=%v chain=%s => issued refresh=%s key=%s",
@@ -119,17 +153,25 @@ func (s *Service) Login(subject string, roles, scopes []string, now time.Time) (
 	return &IssueResult{AccessToken: tok, RefreshToken: refresh, Session: sess}, nil
 }
 
-// revokeChainLocked marks every session of a chain revoked. Refresh
+// revokeChainLocked marks every session of a chain revoked and records the
+// cause-specific code later refreshes on this chain will receive. Refresh
 // credentials of a terminated chain are retained in the index so later
-// presentations are classified as replay instead of "not found".
-func (s *Service) revokeChainLocked(chainID, reason string) {
+// presentations are classified as terminated instead of "not found".
+func (s *Service) revokeChainLocked(chainID, reason string, code ErrorCode) {
 	for _, n := range s.chains[chainID] {
 		n.Revoked = true
 	}
+	s.termCode[chainID] = code
 	if s.opts.Logger != nil {
-		s.opts.Logger.Printf("chain-terminated: chain=%s reason=%q sessions=%d",
-			chainID[:8], reason, len(s.chains[chainID]))
+		s.opts.Logger.Printf("chain-terminated: chain=%s reason=%q code=%s sessions=%d",
+			chainID[:8], reason, code, len(s.chains[chainID]))
 	}
+}
+
+// chainRevokedLocked reports whether every session of the chain is revoked.
+func (s *Service) chainRevokedLocked(chainID string) bool {
+	nodes := s.chains[chainID]
+	return len(nodes) > 0 && nodes[0].Revoked
 }
 
 // Refresh performs a one-time rotation.
@@ -158,12 +200,16 @@ func (s *Service) Refresh(raw string, now time.Time) (*IssueResult, error) {
 		}
 		return nil, newError(ErrRefreshNotFound, "refresh credential is not recognized")
 	case sess.Revoked:
+		code := s.termCode[sess.ChainID]
+		if code == "" {
+			code = ErrRefreshReplayed
+		}
 		s.mu.Unlock()
 		if s.opts.Logger != nil {
-			s.opts.Logger.Printf("refresh: input=%s chain=%s => denied refresh_replayed (chain already terminated)",
-				short(raw), sess.ChainID[:8])
+			s.opts.Logger.Printf("refresh: input=%s chain=%s => denied %s (chain already terminated)",
+				short(raw), sess.ChainID[:8], code)
 		}
-		return nil, newError(ErrRefreshReplayed, "credential belongs to chain %s terminated by a detected replay", sess.ChainID[:8])
+		return nil, newError(code, "credential belongs to chain %s already terminated", sess.ChainID[:8])
 	}
 	if _, busy := s.inflight[raw]; busy {
 		s.mu.Unlock()
@@ -174,7 +220,7 @@ func (s *Service) Refresh(raw string, now time.Time) (*IssueResult, error) {
 		return nil, newError(ErrConcurrentRefresh, "a refresh for this credential is already in progress")
 	}
 	if sess.Used {
-		s.revokeChainLocked(sess.ChainID, "replayed consumed credential "+short(raw))
+		s.revokeChainLocked(sess.ChainID, "replayed consumed credential "+short(raw), ErrRefreshReplayed)
 		s.mu.Unlock()
 		if s.opts.Logger != nil {
 			s.opts.Logger.Printf("refresh: input=%s chain=%s => denied refresh_replayed + chain revoked (one-time-use violation)",
@@ -210,6 +256,7 @@ func (s *Service) Refresh(raw string, now time.Time) (*IssueResult, error) {
 		Subject: sess.Subject, Roles: append([]string(nil), sess.Roles...),
 		Scopes:   append([]string(nil), sess.Scopes...),
 		IssuedAt: now, ExpiresAt: now.Add(s.opts.AccessTokenTTL),
+		ChainID: sess.ChainID,
 	}, now)
 	if err != nil {
 		return nil, MapTokenError(err)
@@ -223,14 +270,20 @@ func (s *Service) Refresh(raw string, now time.Time) (*IssueResult, error) {
 	cur, ok := s.byRefresh[raw]
 	switch {
 	case !ok || cur.Revoked:
+		code := ErrRefreshReplayed
+		if ok {
+			if c := s.termCode[cur.ChainID]; c != "" {
+				code = c
+			}
+		}
 		delete(s.inflight, raw)
 		s.mu.Unlock()
 		if s.opts.Logger != nil {
-			s.opts.Logger.Printf("refresh: input=%s => denied refresh_replayed (chain terminated concurrently)", short(raw))
+			s.opts.Logger.Printf("refresh: input=%s => denied %s (chain terminated concurrently)", short(raw), code)
 		}
-		return nil, newError(ErrRefreshReplayed, "chain terminated concurrently during refresh")
+		return nil, newError(code, "chain terminated concurrently during refresh")
 	case cur.Used:
-		s.revokeChainLocked(cur.ChainID, "concurrent double-commit of "+short(raw))
+		s.revokeChainLocked(cur.ChainID, "concurrent double-commit of "+short(raw), ErrRefreshReplayed)
 		delete(s.inflight, raw)
 		s.mu.Unlock()
 		if s.opts.Logger != nil {
@@ -284,6 +337,20 @@ func (s *Service) Authenticate(accessToken string, now time.Time) (*tokens.Claim
 		}
 		return nil, ae
 	}
+	// A token bound to a terminated chain is invalid immediately, even if
+	// its signature and expiry are still fine.
+	if claims.ChainID != "" {
+		s.mu.Lock()
+		revoked := s.chainRevokedLocked(claims.ChainID)
+		s.mu.Unlock()
+		if revoked {
+			if s.opts.Logger != nil {
+				s.opts.Logger.Printf("authenticate: input=%s chain=%s => denied session_revoked (chain terminated)",
+					short(accessToken), claims.ChainID[:8])
+			}
+			return nil, newError(ErrSessionRevoked, "session chain %s has been terminated", claims.ChainID[:8])
+		}
+	}
 	if s.opts.Logger != nil {
 		s.opts.Logger.Printf("authenticate: input=%s => accepted subject=%s roles=%v scopes=%v",
 			short(accessToken), claims.Subject, claims.Roles, claims.Scopes)
@@ -296,4 +363,85 @@ func (s *Service) ChainLength(chainID string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.chains[chainID])
+}
+
+// Logout terminates the chain the presented refresh credential belongs to.
+//
+// Semantics (deterministic):
+//   - unknown/empty credential ..... refresh_not_found (nothing changes)
+//   - known credential ............. its whole chain is revoked exactly once
+//   - already-terminated chain ..... idempotent success, no error
+//
+// After logout, access tokens issued on the chain fail authentication and
+// any refresh on the chain yields session_revoked (distinct from
+// refresh_not_found). Other chains of the same subject are untouched.
+func (s *Service) Logout(raw string, now time.Time) error {
+	if raw == "" {
+		return newError(ErrRefreshNotFound, "empty refresh credential")
+	}
+	s.mu.Lock()
+	sess, ok := s.byRefresh[raw]
+	if !ok {
+		s.mu.Unlock()
+		if s.opts.Logger != nil {
+			s.opts.Logger.Printf("logout: input=%s => denied refresh_not_found (credential not indexed)", short(raw))
+		}
+		return newError(ErrRefreshNotFound, "refresh credential is not recognized")
+	}
+	if s.chainRevokedLocked(sess.ChainID) {
+		s.mu.Unlock()
+		if s.opts.Logger != nil {
+			s.opts.Logger.Printf("logout: input=%s chain=%s => ok (idempotent; chain already terminated)",
+				short(raw), sess.ChainID[:8])
+		}
+		return nil
+	}
+	s.revokeChainLocked(sess.ChainID, "logout via credential "+short(raw), ErrSessionRevoked)
+	subject := sess.Subject
+	chainID := sess.ChainID
+	s.mu.Unlock()
+	if s.opts.Logger != nil {
+		s.opts.Logger.Printf("logout: input=%s subject=%s chain=%s => terminated at %s",
+			short(raw), subject, chainID[:8], now.Format(time.RFC3339))
+	}
+	return nil
+}
+
+// TerminateSubject revokes every live chain of subject atomically and
+// returns how many chains were terminated by this call.
+//
+// The whole operation runs under the state lock, and Refresh revalidates
+// the chain under the same lock before committing a rotation. Therefore
+// once TerminateSubject returns, no refresh for this subject can succeed
+// and no in-flight refresh can append a new session: the outcome does not
+// depend on goroutine scheduling.
+func (s *Service) TerminateSubject(subject string, now time.Time) int {
+	s.mu.Lock()
+	terminated := 0
+	for id := range s.subjectChains[subject] {
+		if s.chainRevokedLocked(id) {
+			continue
+		}
+		s.revokeChainLocked(id, "subject terminated", ErrSessionRevoked)
+		terminated++
+	}
+	s.mu.Unlock()
+	if s.opts.Logger != nil {
+		s.opts.Logger.Printf("terminate-subject: subject=%s => terminated=%d at %s",
+			subject, terminated, now.Format(time.RFC3339))
+	}
+	return terminated
+}
+
+// ActiveChains reports how many live (non-terminated) chains subject holds.
+func (s *Service) ActiveChains(subject string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	active := 0
+	for id := range s.subjectChains[subject] {
+		if !s.chainRevokedLocked(id) {
+			active++
+		}
+	}
+	return active
 }
