@@ -25,6 +25,16 @@ const (
 	ErrRefreshReplayed    ErrorCode = "refresh_replayed"
 	ErrRefreshExpired     ErrorCode = "refresh_expired"
 	ErrConcurrentRefresh  ErrorCode = "concurrent_refresh"
+	// ErrRefreshRevoked: the credential is known, but its chain was ended
+	// voluntarily (logout / per-subject termination). Distinct from both
+	// "never seen" (refresh_not_found) and "replay detected" (refresh_replayed).
+	ErrRefreshRevoked ErrorCode = "refresh_revoked"
+	// ErrSessionRevoked: an access token verified cryptographically, but its
+	// session chain has already been terminated.
+	ErrSessionRevoked ErrorCode = "session_revoked"
+	// ErrTooManySessions: login refused because the subject already holds the
+	// configured maximum of active chains.
+	ErrTooManySessions ErrorCode = "session_limit_exceeded"
 )
 
 // Error is a classified authentication error.

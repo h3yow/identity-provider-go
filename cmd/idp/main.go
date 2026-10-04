@@ -39,7 +39,9 @@ func main() {
 	authSvc := auth.NewService(signer, auth.Options{
 		AccessTokenTTL:  15 * time.Minute,
 		RefreshTokenTTL: 24 * time.Hour,
-		Logger:          logger,
+		// Capacity gate: at most 5 live session chains per subject locally.
+		MaxActiveChainsPerSubject: 5,
+		Logger:                    logger,
 	})
 
 	// Demo RBAC policy: roles map to granted scopes.
@@ -54,7 +56,7 @@ func main() {
 	if p := os.Getenv("IDP_ADDR"); p != "" {
 		addr = p
 	}
-	logger.Printf("listening on %s (endpoints: /login /refresh /verify /authz)", addr)
+	logger.Printf("listening on %s (endpoints: /login /refresh /logout /terminate /verify /authz)", addr)
 	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
 		log.Fatal(err)
 	}

@@ -151,6 +151,100 @@ func TestHTTPConcurrentRefreshSingleWinner(t *testing.T) {
 	}
 }
 
+// Logout over HTTP: the chain's access token dies at once, its refresh
+// credentials yield 401 refresh_revoked, and a repeated logout stays 200.
+func TestHTTPLogout(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	h := srv.Handler()
+
+	_, login := post(t, h, "/login", map[string]any{"subject": "olga"})
+	access, _ := login["access_token"].(string)
+	refresh, _ := login["refresh_token"].(string)
+
+	st, out := post(t, h, "/logout", map[string]any{"refresh_token": refresh})
+	if st != 200 || out["status"] != "logged_out" {
+		t.Fatalf("logout => %d %v, want 200 logged_out", st, out)
+	}
+	// Idempotent: same call again is still 200.
+	if st, out := post(t, h, "/logout", map[string]any{"refresh_token": refresh}); st != 200 || out["status"] != "logged_out" {
+		t.Fatalf("repeat logout => %d %v, want 200 logged_out", st, out)
+	}
+	// Access token on the terminated chain is rejected with session_revoked.
+	if st, m := post(t, h, "/verify", map[string]any{"access_token": access}); st != 401 || m["error"] != "session_revoked" {
+		t.Fatalf("verify after logout => %d %v, want 401 session_revoked", st, m)
+	}
+	// Refresh on the terminated chain is refresh_revoked, not not_found.
+	if st, m := post(t, h, "/refresh", map[string]any{"refresh_token": refresh}); st != 401 || m["error"] != "refresh_revoked" {
+		t.Fatalf("refresh after logout => %d %v, want 401 refresh_revoked", st, m)
+	}
+	// Unknown credential on /logout is 401 refresh_not_found.
+	if st, m := post(t, h, "/logout", map[string]any{"refresh_token": "00deadbeef"}); st != 401 || m["error"] != "refresh_not_found" {
+		t.Fatalf("logout unknown => %d %v, want 401 refresh_not_found", st, m)
+	}
+}
+
+// Per-subject termination over HTTP kills all of the subject's chains and
+// none of anyone else's.
+func TestHTTPTerminateSubject(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	h := srv.Handler()
+
+	_, l1 := post(t, h, "/login", map[string]any{"subject": "pat"})
+	_, l2 := post(t, h, "/login", map[string]any{"subject": "pat"})
+	_, other := post(t, h, "/login", map[string]any{"subject": "quinn"})
+
+	st, out := post(t, h, "/terminate", map[string]any{"subject": "pat"})
+	if st != 200 || out["chains"].(float64) != 2 {
+		t.Fatalf("terminate => %d %v, want 200 chains=2", st, out)
+	}
+	for _, l := range []map[string]any{l1, l2} {
+		rt, _ := l["refresh_token"].(string)
+		at, _ := l["access_token"].(string)
+		if st, m := post(t, h, "/refresh", map[string]any{"refresh_token": rt}); st != 401 || m["error"] != "refresh_revoked" {
+			t.Fatalf("pat refresh after terminate => %d %v, want 401 refresh_revoked", st, m)
+		}
+		if st, m := post(t, h, "/verify", map[string]any{"access_token": at}); st != 401 || m["error"] != "session_revoked" {
+			t.Fatalf("pat verify after terminate => %d %v, want 401 session_revoked", st, m)
+		}
+	}
+	// quinn is untouched.
+	ort, _ := other["refresh_token"].(string)
+	if st, _ := post(t, h, "/refresh", map[string]any{"refresh_token": ort}); st != 200 {
+		t.Fatalf("quinn refresh must survive, got %d", st)
+	}
+	// Terminating a subject with no live chains is a 200 no-op.
+	if st, out := post(t, h, "/terminate", map[string]any{"subject": "nobody"}); st != 200 || out["chains"].(float64) != 0 {
+		t.Fatalf("terminate nobody => %d %v, want 200 chains=0", st, out)
+	}
+}
+
+// The capacity gate surfaces over HTTP as a distinguishable 409.
+func TestHTTPSessionLimit(t *testing.T) {
+	t0 := time.Date(2026, 9, 25, 10, 0, 0, 0, time.UTC)
+	r := keys.NewKeyRing()
+	if _, err := r.Rotate("k1", []byte("http-secret"), t0, time.Hour, 2*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	authn := auth.NewService(tokens.NewSigner(r), auth.Options{
+		AccessTokenTTL: 30 * time.Minute, RefreshTokenTTL: 2 * time.Hour,
+		MaxActiveChainsPerSubject: 1,
+	})
+	pol := authz.NewPolicy()
+	limited := New(Config{
+		Auth: authn, Authz: authz.NewAuthorizer(authn, pol, nil),
+		Now: func() time.Time { return t0 },
+	}).Handler()
+
+	if st, _ := post(t, limited, "/login", map[string]any{"subject": "rita"}); st != 200 {
+		t.Fatalf("first login => %d, want 200", st)
+	}
+	st, m := post(t, limited, "/login", map[string]any{"subject": "rita"})
+	if st != http.StatusConflict || m["error"] != "session_limit_exceeded" {
+		t.Fatalf("second login => %d %v, want 409 session_limit_exceeded", st, m)
+	}
+	t.Logf("capacity gate over HTTP: second login => 409 session_limit_exceeded (distinct from 401 causes)")
+}
+
 // Unknown vs retired vs rotated key distinctions across /verify.
 func TestHTTPKeyRotationDistinctions(t *testing.T) {
 	srv, ring, t0 := newTestServer(t)

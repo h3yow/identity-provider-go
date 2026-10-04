@@ -2,16 +2,20 @@
 //
 // Endpoints:
 //
-//	POST /login    {subject}                 -> access_token, refresh_token
-//	POST /refresh  {refresh_token}           -> rotated access/refresh tokens
-//	POST /verify   {access_token}            -> claims or classified 401
-//	POST /authz    {access_token, roles?, scopes?} -> allow or 401/403
+//	POST /login     {subject}                 -> access_token, refresh_token
+//	POST /refresh   {refresh_token}           -> rotated access/refresh tokens
+//	POST /logout    {refresh_token}           -> end that session chain (idempotent)
+//	POST /terminate {subject}                 -> end all live chains of a subject
+//	POST /verify    {access_token}            -> claims or classified 401
+//	POST /authz     {access_token, roles?, scopes?} -> allow or 401/403
 //
 // HTTP status mapping is fixed:
 //
 //	missing/expired/bad token, unknown/retired key -> 401
+//	terminated session chain (token or refresh)    -> 401 session_revoked / refresh_revoked
 //	verified but lacking role or scope             -> 403
 //	replayed / concurrent refresh                  -> 401 with error code
+//	per-subject session limit reached              -> 409 session_limit_exceeded
 //
 // Response bodies always carry the machine-readable error code plus a
 // human-readable reason so conclusions are explainable at every entry point.
@@ -56,6 +60,8 @@ func (s *Server) Handler() http.Handler { return s.mux }
 func (s *Server) routes() {
 	s.mux.HandleFunc("/login", s.handleLogin)
 	s.mux.HandleFunc("/refresh", s.handleRefresh)
+	s.mux.HandleFunc("/logout", s.handleLogout)
+	s.mux.HandleFunc("/terminate", s.handleTerminate)
 	s.mux.HandleFunc("/verify", s.handleVerify)
 	s.mux.HandleFunc("/authz", s.handleAuthz)
 }
@@ -143,6 +149,42 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type logoutReq struct {
+	RefreshToken string `json:"refresh_token"`
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	var req logoutReq
+	if !decode(w, r, &req) {
+		return
+	}
+	res, err := s.cfg.Auth.Logout(req.RefreshToken)
+	if err != nil {
+		writeAuthError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "logged_out", "chain_id": res.ChainID, "sessions": res.Sessions,
+	})
+}
+
+type terminateReq struct {
+	Subject string `json:"subject"`
+}
+
+func (s *Server) handleTerminate(w http.ResponseWriter, r *http.Request) {
+	var req terminateReq
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Subject == "" {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: "bad_request", Reason: "subject is required"})
+		return
+	}
+	n := s.cfg.Auth.TerminateSubject(req.Subject)
+	writeJSON(w, http.StatusOK, map[string]any{"status": "terminated", "subject": req.Subject, "chains": n})
+}
+
 type verifyReq struct {
 	AccessToken string `json:"access_token"`
 }
@@ -212,6 +254,9 @@ func writeAuthError(w http.ResponseWriter, err error) {
 	}
 	status := http.StatusUnauthorized
 	switch ae.Code {
+	case auth.ErrTooManySessions:
+		// Capacity gate: a definite, distinguishable refusal — 409 Conflict.
+		status = http.StatusConflict
 	case auth.ErrInvalidCredentials,
 		auth.ErrMissingToken,
 		auth.ErrTokenMalformed,
@@ -222,7 +267,9 @@ func writeAuthError(w http.ResponseWriter, err error) {
 		auth.ErrRefreshNotFound,
 		auth.ErrRefreshReplayed,
 		auth.ErrRefreshExpired,
-		auth.ErrConcurrentRefresh:
+		auth.ErrConcurrentRefresh,
+		auth.ErrRefreshRevoked,
+		auth.ErrSessionRevoked:
 		status = http.StatusUnauthorized
 	}
 	writeJSON(w, status, apiError{Error: string(ae.Code), Reason: ae.Reason})

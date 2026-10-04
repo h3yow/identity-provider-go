@@ -51,9 +51,12 @@ func tokenError(code ErrorCode, format string, args ...any) *Error {
 
 // Claims are the verifiable contents of an access token.
 type Claims struct {
-	Subject   string
-	Roles     []string
-	Scopes    []string
+	Subject string
+	Roles   []string
+	Scopes  []string
+	// ChainID binds the token to the session chain that issued it. Empty for
+	// tokens minted outside a session chain (revocation checks are skipped).
+	ChainID   string
 	IssuedAt  time.Time
 	ExpiresAt time.Time
 }
@@ -90,6 +93,7 @@ type wireClaims struct {
 	Sub   string   `json:"sub"`
 	Roles []string `json:"roles"`
 	Scp   []string `json:"scp"`
+	Cid   string   `json:"cid,omitempty"`
 	Iat   int64    `json:"iat"`
 	Exp   int64    `json:"exp"`
 }
@@ -108,7 +112,7 @@ func (s *Signer) Sign(c Claims, now time.Time) (*Token, error) {
 	hdr := wireHeader{Alg: "HS256", Kid: v.ID}
 	body := wireClaims{
 		Sub: c.Subject, Roles: append([]string(nil), c.Roles...),
-		Scp: append([]string(nil), c.Scopes...),
+		Scp: append([]string(nil), c.Scopes...), Cid: c.ChainID,
 		Iat: c.IssuedAt.Unix(), Exp: c.ExpiresAt.Unix(),
 	}
 	hb, err := json.Marshal(hdr)
@@ -187,7 +191,7 @@ func (s *Signer) Verify(raw string, now time.Time) (*Claims, error) {
 		return nil, tokenError(ErrMalformed, "claims not json: %v", err)
 	}
 	claims := &Claims{
-		Subject: body.Sub, Roles: body.Roles, Scopes: body.Scp,
+		Subject: body.Sub, Roles: body.Roles, Scopes: body.Scp, ChainID: body.Cid,
 		IssuedAt:  time.Unix(body.Iat, 0).UTC(),
 		ExpiresAt: time.Unix(body.Exp, 0).UTC(),
 	}
