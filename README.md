@@ -63,17 +63,38 @@ CreatedAt + ExpiresAt + RetireAt` 描述，在任意时刻处于以下三态之�
 | 所属链被重放检测终止              | `refresh_replayed`    | 无       |
 | 所属链被登出/按主体终止           | `refresh_revoked`     | 无       |
 | 同一凭据已有刷新在进行中          | `concurrent_refresh`  | 无       |
-| 凭据已被消费（再次出现）          | `refresh_replayed`    | **撤销整条链** |
+| 已消费凭据：链已推进到后继之后    | `refresh_replayed`    | **撤销整条链** |
+| 已消费凭据：后继仍是链尖且在宽限窗口内重复出现（并发重复/超时短时间重试） | `concurrent_refresh` | 无（链保持存活） |
+| 已消费凭据：宽限窗口之后才再次出现 | `refresh_replayed`   | **撤销整条链** |
 | 凭据未消费但已过期                | `refresh_expired`     | 无       |
 | 正常                              | 成功，轮换恰好一次     | 追加 1 个会话 |
 
-- **重放即终止链路**：已使用过的旧凭据再次出现，判定为一次性使用违例，链上所有
-  会话标记 `Revoked`。之后链上任何凭据（包括刚轮换出的「新」凭据）再使用都得到
-  `refresh_replayed`，不会产生重复会话或状态分叉。
+- **重放即终止链路（确定，不随时序漂移）**：对「已消费凭据」的判定只依赖
+  **已提交的链结构**和**调用方提供的时钟**，与 goroutine 调度无关：
+  - 该凭据的**后继本身也已被消费**（链已经又往前走了一步，例如
+    `R1→R2→R3` 之后再拿 R1 来用）→ 无论距上次使用多久，都是明确的重放，
+    判定 `refresh_replayed` 并撤销整条链；
+  - 后继仍是当前链尖，但重复呈现在消费时刻起的**重放判定宽限窗口**
+    （`Options.ReplayGrace`，默认 30s）**之内** → 判定
+    `concurrent_refresh`，**不改变任何状态、不终止链**。这正好覆盖两种
+    非攻击情形：同一凭据被并发提交时输给赢家的那一方，以及客户端超时后
+    在很短时间内拿同一凭据重试、而赢家其实已经轮换成功；
+  - 后继仍是链尖、但重复呈现落在窗口**之后** → 才是真正意义上的重放，
+    判定 `refresh_replayed` 并撤销链。
+  - 窗口边界是时钟决定的：`now <= consumedAt + ReplayGrace` 视为窗口内，
+    晚 1ns 即为窗口外，可重复复现（见 `TestGraceBoundaryIsClockDetermined`）。
+- **重放检测能力不被削弱**：链路一旦完成轮换（老凭据的后继也被消费），
+  再回头用被换掉的老凭据，依然立刻识别为重放并结束整条链
+  （`TestReplayTerminatesChain` / `TestReplayOnceChainAdvanced`）；宽限
+  窗口只对「链尖尚未再往前推进」的短时间重复生效。
 - **并发刷新只允许一个成功**：服务以全局互斥串行化状态变更，并对「正在轮换」的
-  凭据维护 in-flight 预留。N 个并发请求中恰好 1 个成功，其余得到
-  `concurrent_refresh` 且不改变任何状态；提交阶段会在锁内二次校验，防止准备期间
-  链被其他重放终止。测试用 32/16 goroutine + `-race` 验证无分叉、无重复会话。
+  凭据维护 in-flight 预留。N 个并发请求中恰好 1 个成功，**其余全部得到
+  `concurrent_refresh`（绝不允许有时算 `concurrent_refresh`、有时算
+  `refresh_replayed`）**，不改变任何状态，也不会把本来还活着的链提前结束；
+  赢家轮换出的新凭据在风暴过后仍可正常使用。提交阶段会在锁内二次校验，防止
+  准备期间链被其他重放终止。测试用 32/48 goroutine、重复 15~30 轮 +
+  `-race` 验证无分叉、无重复会话、零误杀（`TestConcurrentRefreshSingleWinner`、
+  `TestDuplicateBurstNeverReplays`、`TestRetryAfterCommitWithinGraceStable`）。
 
 ## 3. 会话的结束：登出与按主体终止
 
@@ -90,11 +111,24 @@ CreatedAt + ExpiresAt + RetireAt` 描述，在任意时刻处于以下三态之�
     的其他链不受牵连。凭据从未存在时返回 `401 refresh_not_found`。
 - **按主体终止（`TerminateSubject` / `POST /terminate {subject}`）**：一次性结束该
   主体当前所有存活链，返回终止的链数；对无存活链的主体是 200 幂等空操作。
-  - **与刷新的竞争是确定的**：终止与刷新提交共用同一把状态锁。终止返回后，该主体
-    名下**不可能再刷新成功**（一律 `refresh_revoked`），也**不会再冒出新会话**—
-    —在终止前已开始、但尚未提交的刷新，会在提交阶段看到链已终止而失败；在终止前
-    已提交的会话，会被终止一并撤销。无论调度如何交错，结论一致（
-    `TestTerminateSubjectRacesRefresh` 用 4 链 × 8 goroutine + `-race` 验证）。
+  - **与刷新的竞争是确定的（只有两种归宿）**：终止与刷新提交共用同一把状态锁，
+    在途刷新要么**在终止取锁之前就已提交完成**（其新增会话会被这次终止一并撤销，
+    链长度冻结在终止时刻），要么**在提交阶段看到链已终止而失败**。终止一旦返回：
+    - 该主体名下**任意一条链、任意一个凭据**（登录凭据、已被轮换掉的旧凭据、
+      在途赢家刚轮换出的新凭据）再去刷新，结论**固定且每次一致**地是
+      `401 refresh_revoked`——它与「这个凭据压根没出现过」的
+      `refresh_not_found` 可区分，也**绝不会**因为竞争时序而变成
+      `refresh_replayed`（竞争中的重复请求在链存活时只会得到
+      `concurrent_refresh`，链终止后一律 `refresh_revoked`）；
+    - **不可能再刷新成功，也不会再凭空多出一条会话**：终止后的探针反复执行，
+      链长度保持冻结；
+    - 链上已签发的访问令牌立即失效（`session_revoked`）。
+  - 无论调度如何交错，以上结论都一致。`TestTerminateSubjectRacesRefresh`
+    （4 链 × 8 goroutine）与 `TestTerminateRacesRefreshDeterministic`
+    （3 链 × 8 goroutine、25 轮，含赢家提交后立刻重试旧凭据的在途重复）以及
+    HTTP 层 `TestHTTPTerminateRacesRefreshDeterministic`（20 轮）均在
+    `-race` 下验证：零 `refresh_replayed` 误判、终止后全部 `refresh_revoked`、
+    链长度冻结。
   - 终止不封禁主体：之后重新登录会开一条全新的链，属正常行为。
 
 ## 4. 每主体活跃链上限（容量闸门）
@@ -155,13 +189,21 @@ CreatedAt + ExpiresAt + RetireAt` 描述，在任意时刻处于以下三态之�
 # 运行全部测试（含竞态检测）
 go test ./... -race -v
 
+# 并发场景反复重复多轮（本轮收尾的重点），日志可见关键输入与每轮最终判定：
+go test ./internal/auth/ -race -v -count=30 -run \
+  'TestTerminateRacesRefreshDeterministic|TestRetryAfterCommitWithinGraceStable|TestDuplicateBurstNeverReplays|TestGraceBoundaryIsClockDetermined|TestReplayOnceChainAdvanced|TestReplayAfterGraceStillTerminates'
+go test ./internal/server/ -race -v -count=20 -run \
+  'TestHTTPTerminateRacesRefreshDeterministic|TestHTTPConcurrentRefreshSingleWinner'
+
 # 只看关键场景
 go test ./internal/keys/  -v   # 轮换、active/grace/retired 三态
 go test ./internal/tokens/ -v # 多版本共存、宽限、过期/签名/未知/退役区分
-go test ./internal/auth/  -v   # 一次性轮换、重放终止链、32 并发单赢家、
+go test ./internal/auth/  -v   # 一次性轮换、真重放终止链、32/48 并发单赢家、
+                               # 窗口内重试不杀链/窗口外与链推进后真重放、
                                # 登出/按主体终止/容量闸门、终止与刷新竞争
 go test ./internal/authz/ -v   # 四值判定、权限不扩散、并发稳定
-go test ./internal/server/ -v  # HTTP 端到端、401/403/409 区分、登出与终止
+go test ./internal/server/ -v  # HTTP 端到端、401/403/409 区分、登出与终止、
+                               # 同凭据并发、终止与刷新竞争
 
 # 启动服务并手工验证
 go run ./cmd/idp
@@ -182,7 +224,13 @@ curl -s -XPOST $BASE/authz  -d "{\"access_token\":\"$AT\",\"scopes\":[\"admin\"]
 curl -s -XPOST $BASE/authz  -d '{}'                                                  # 401 missing_token
 
 NEW=$(curl -s -XPOST $BASE/refresh -d "{\"refresh_token\":\"$RT\"}")
-curl -i -XPOST $BASE/refresh -d "{\"refresh_token\":\"$RT\"}"   # 401 refresh_replayed，链路终止
+# 立刻再用刚被换掉的 RT（默认 30s 宽限窗口内、后继仍是链尖）：
+#   401 concurrent_refresh，链不受影响；新凭据仍可继续刷新
+curl -i -XPOST $BASE/refresh -d "{\"refresh_token\":\"$RT\"}"
+# 等待超过 30s（默认 ReplayGrace）后再用同一个已消费的 RT：
+#   401 refresh_replayed，链路终止；之后链上任何凭据都 refresh_replayed
+sleep 31
+curl -i -XPOST $BASE/refresh -d "{\"refresh_token\":\"$RT\"}"
 
 # 登出与按主体终止
 LOGIN2=$(curl -s -XPOST $BASE/login -d '{"subject":"alice"}')

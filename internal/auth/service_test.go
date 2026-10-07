@@ -116,7 +116,9 @@ func TestUnknownAndExpiredRefresh(t *testing.T) {
 }
 
 // Concurrent refreshes of the same credential: exactly one success, no chain
-// fork; losers are classified as concurrent_refresh and change no state.
+// fork; every loser is classified concurrent_refresh (never refresh_replayed),
+// changes no state, and the chain must remain fully usable afterwards. The
+// outcome is independent of scheduling.
 func TestConcurrentRefreshSingleWinner(t *testing.T) {
 	t0 := time.Date(2026, 9, 25, 10, 0, 0, 0, time.UTC)
 	svc, _ := testService(t, t0, 10*time.Minute, time.Hour)
@@ -127,17 +129,19 @@ func TestConcurrentRefreshSingleWinner(t *testing.T) {
 	winners, losers, replays := 0, 0, 0
 	var mu sync.Mutex
 	start := make(chan struct{})
+	var winnerRT string
 	wg.Add(n)
 	for i := 0; i < n; i++ {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, err := svc.Refresh(res.RefreshToken, t0.Add(time.Minute))
+			r, err := svc.Refresh(res.RefreshToken, t0.Add(time.Minute))
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
 			case err == nil:
 				winners++
+				winnerRT = r.RefreshToken
 			case code(err) == ErrConcurrentRefresh:
 				losers++
 			case code(err) == ErrRefreshReplayed:
@@ -153,12 +157,28 @@ func TestConcurrentRefreshSingleWinner(t *testing.T) {
 	if winners != 1 {
 		t.Fatalf("winners = %d, want exactly 1", winners)
 	}
-	if losers+replays != n-1 {
-		t.Fatalf("non-winners = %d, want %d", losers+replays, n-1)
+	if losers != n-1 {
+		t.Fatalf("concurrent_refresh losers = %d, want %d (any replay would be a scheduling-dependent false positive)", losers, n-1)
+	}
+	if replays != 0 {
+		t.Fatalf("replays = %d, want 0 (a concurrent duplicate must never terminate a live chain)", replays)
 	}
 	if n := svc.ChainLength(res.Session.ChainID); n != 2 {
 		t.Fatalf("chain length = %d, want 2 (no duplicate session/fork)", n)
 	}
+	// The winner's fresh credential must still rotate: the chain survived the
+	// duplicate storm, and an immediate retry of the consumed input stays a
+	// harmless concurrent_refresh inside the grace window.
+	if _, err := svc.Refresh(res.RefreshToken, t0.Add(1*time.Minute)); code(err) != ErrConcurrentRefresh {
+		t.Fatalf("immediate retry of consumed credential => %v, want concurrent_refresh", err)
+	}
+	if _, err := svc.Refresh(winnerRT, t0.Add(2*time.Minute)); err != nil {
+		t.Fatalf("winner credential must still rotate after the duplicate storm: %v", err)
+	}
+	if n := svc.ChainLength(res.Session.ChainID); n != 3 {
+		t.Fatalf("chain length = %d, want 3 (one legitimate append after the storm)", n)
+	}
+	t.Logf("post-storm: chain still live, length=3; retry input=%s => concurrent_refresh, winner rotated", short(res.RefreshToken))
 }
 
 // Refreshes never widen the original grant, even across multiple rotations.

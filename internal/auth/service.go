@@ -20,7 +20,15 @@ type Options struct {
 	// MaxActiveChainsPerSubject caps how many un-terminated session chains a
 	// single subject may hold at once. Zero means unlimited.
 	MaxActiveChainsPerSubject int
-	Logger                    Logger
+	// ReplayGrace is the bounded window after a credential was consumed inside
+	// which a duplicate presentation is classified as a concurrent/timeout
+	// retry (concurrent_refresh, no state change) instead of a one-time-use
+	// violation (refresh_replayed, chain terminated) — but only while the
+	// credential's successor is still the live chain tip. Once the chain has
+	// moved past the successor, reuse is always replay, regardless of the
+	// clock. Zero defaults to 30s.
+	ReplayGrace time.Duration
+	Logger      Logger
 }
 
 func (o Options) withDefaults() Options {
@@ -29,6 +37,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.RefreshTokenTTL <= 0 {
 		o.RefreshTokenTTL = 7 * 24 * time.Hour
+	}
+	if o.ReplayGrace <= 0 {
+		o.ReplayGrace = 30 * time.Second
 	}
 	return o
 }
@@ -50,6 +61,10 @@ type Session struct {
 	ExpiresAt    time.Time
 	Used         bool
 	Revoked      bool
+	// consumedAt records when the credential was marked used. Together with the
+	// replay-grace window it distinguishes a concurrent/timeout retry from a
+	// genuine one-time-use violation; zero for unconsumed credentials.
+	consumedAt time.Time
 }
 
 // IssueResult is returned by login and refresh.
@@ -194,15 +209,56 @@ func (s *Service) revokeChainLocked(chainID, reason string) bool {
 	return true
 }
 
+// replayGateLocked classifies a presentation of an already-consumed
+// credential whose chain is still live. The decision depends only on the
+// committed chain state and on the supplied clock (never on goroutine
+// scheduling), so the same inputs always produce the same code:
+//
+//   - the chain already moved past this credential's successor (the successor
+//     itself has been consumed) => genuine replay, terminate the chain;
+//   - successor is still the live chain tip and the duplicate is presented
+//     within ReplayGrace of consumption (a concurrent duplicate or a client
+//     timeout retry landing just after the winner committed) =>
+//     concurrent_refresh, no state change, chain stays live;
+//   - otherwise (duplicate later than the grace window) => genuine replay.
+func (s *Service) replayGateLocked(sess *Session, now time.Time) ErrorCode {
+	successorConsumed := true // be conservative when no successor is found
+	found := false
+	for _, n := range s.chains[sess.ChainID] {
+		if n.ParentID == sess.ID {
+			found = true
+			successorConsumed = n.Used
+			break
+		}
+	}
+	withinGrace := !sess.consumedAt.IsZero() &&
+		!now.After(sess.consumedAt.Add(s.opts.ReplayGrace))
+	if found && !successorConsumed && withinGrace {
+		return ErrConcurrentRefresh
+	}
+	return ErrRefreshReplayed
+}
+
 // Refresh performs a one-time rotation.
 //
-// Semantics (deterministic):
-//   - unknown credential ........... refresh_not_found
-//   - credential of revoked chain .. refresh_replayed (chain terminated)
-//   - another refresh in flight .... concurrent_refresh (no state changes)
-//   - already-consumed credential .. refresh_replayed; whole chain revoked
-//   - expired, unconsumed .......... refresh_expired (no rotation)
-//   - otherwise .................... rotate exactly once, append one session
+// Semantics (deterministic, scheduling-independent):
+//   - unknown credential ............. refresh_not_found
+//   - credential of terminated chain . refresh_replayed / refresh_revoked by
+//     the recorded termination cause
+//   - another refresh in flight ..... concurrent_refresh (no state changes)
+//   - credential already consumed ... replay gate (see below)
+//   - expired, unconsumed ........... refresh_expired (no rotation)
+//   - otherwise ..................... rotate exactly once, append one session
+//
+// Replay gate for a consumed credential on a still-live chain:
+//   - its successor is itself already consumed (the chain moved on), or the
+//     duplicate lands more than ReplayGrace after consumption =>
+//     refresh_replayed and the whole chain is terminated;
+//   - its successor is still the live chain tip and the duplicate lands
+//     within ReplayGrace (a concurrent duplicate of the in-flight winner, or a
+//     client-timeout retry arriving just after the winner committed) =>
+//     concurrent_refresh with no state change, so a still-live chain is never
+//     killed by a retry.
 //
 // Only one concurrent refresh of the same credential can succeed; losers make
 // no state change and cannot fork the chain.
@@ -237,10 +293,19 @@ func (s *Service) Refresh(raw string, now time.Time) (*IssueResult, error) {
 		return nil, newError(ErrConcurrentRefresh, "a refresh for this credential is already in progress")
 	}
 	if sess.Used {
+		gate := s.replayGateLocked(sess, now)
+		if gate == ErrConcurrentRefresh {
+			s.mu.Unlock()
+			if s.opts.Logger != nil {
+				s.opts.Logger.Printf("refresh: input=%s chain=%s => denied concurrent_refresh (consumed %s ago, within replay-grace %s; successor still live; no state change)",
+					short(raw), sess.ChainID[:8], now.Sub(sess.consumedAt).Round(time.Millisecond), s.opts.ReplayGrace)
+			}
+			return nil, newError(ErrConcurrentRefresh, "refresh credential %s was already consumed by an in-flight or just-completed rotation; concurrent/timeout retry, chain stays live", short(raw))
+		}
 		s.revokeChainLocked(sess.ChainID, "replay")
 		s.mu.Unlock()
 		if s.opts.Logger != nil {
-			s.opts.Logger.Printf("refresh: input=%s chain=%s => denied refresh_replayed + chain revoked (one-time-use violation)",
+			s.opts.Logger.Printf("refresh: input=%s chain=%s => denied refresh_replayed + chain revoked (one-time-use violation after replay-grace or chain advanced)",
 				short(raw), sess.ChainID[:8])
 		}
 		return nil, newError(ErrRefreshReplayed, "refresh credential %s was already consumed; replay detected, chain terminated", short(raw))
@@ -300,13 +365,22 @@ func (s *Service) Refresh(raw string, now time.Time) (*IssueResult, error) {
 		}
 		return nil, terminatedChainError(reason, cur.ChainID)
 	case cur.Used:
-		s.revokeChainLocked(cur.ChainID, "replay")
+		// Unreachable in practice (the inflight reservation serializes
+		// rotations of one credential), but apply the same scheduling-free
+		// gate for defence in depth: never kill a live chain on a retry.
+		gate := s.replayGateLocked(cur, now)
+		if gate == ErrRefreshReplayed {
+			s.revokeChainLocked(cur.ChainID, "replay")
+		}
 		delete(s.inflight, raw)
 		s.mu.Unlock()
 		if s.opts.Logger != nil {
-			s.opts.Logger.Printf("refresh: input=%s => denied refresh_replayed at commit; chain revoked", short(raw))
+			s.opts.Logger.Printf("refresh: input=%s => denied %s at commit (%s)", short(raw), gate, map[bool]string{true: "chain revoked", false: "no state change"}[gate == ErrRefreshReplayed])
 		}
-		return nil, newError(ErrRefreshReplayed, "refresh credential consumed concurrently; chain terminated")
+		if gate == ErrConcurrentRefresh {
+			return nil, newError(ErrConcurrentRefresh, "refresh credential consumed concurrently; concurrent/timeout retry, chain stays live")
+		}
+		return nil, newError(ErrRefreshReplayed, "refresh credential consumed concurrently; replay detected, chain terminated")
 	case !now.Before(cur.ExpiresAt):
 		delete(s.inflight, raw)
 		s.mu.Unlock()
@@ -325,6 +399,7 @@ func (s *Service) Refresh(raw string, now time.Time) (*IssueResult, error) {
 		CreatedAt: now, ExpiresAt: now.Add(s.opts.RefreshTokenTTL),
 	}
 	cur.Used = true
+	cur.consumedAt = now
 	s.byRefresh[newRefresh] = next
 	s.chains[cur.ChainID] = append(s.chains[cur.ChainID], next)
 	delete(s.inflight, raw)
