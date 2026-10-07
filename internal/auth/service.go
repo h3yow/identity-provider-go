@@ -20,8 +20,20 @@ type Options struct {
 	// MaxActiveChainsPerSubject caps how many un-terminated session chains a
 	// single subject may hold at once. Zero means unlimited.
 	MaxActiveChainsPerSubject int
-	Logger                    Logger
+	// RotationGrace is the window after a credential was consumed during which
+	// re-presenting it is treated as a duplicate of the just-completed rotation
+	// (concurrent_refresh, no state change) instead of a replay. It makes
+	// concurrent submissions and client-timeout retries of the same credential
+	// converge on one stable verdict. Zero means the default.
+	RotationGrace time.Duration
+	Logger        Logger
 }
+
+// DefaultRotationGrace bounds how long a just-consumed credential may be
+// re-presented without triggering replay detection. It only needs to cover
+// client-timeout retries (seconds); anything older is treated as a genuine
+// replay of a rotated-out credential.
+const DefaultRotationGrace = 30 * time.Second
 
 func (o Options) withDefaults() Options {
 	if o.AccessTokenTTL <= 0 {
@@ -29,6 +41,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.RefreshTokenTTL <= 0 {
 		o.RefreshTokenTTL = 7 * 24 * time.Hour
+	}
+	if o.RotationGrace <= 0 {
+		o.RotationGrace = DefaultRotationGrace
 	}
 	return o
 }
@@ -49,7 +64,10 @@ type Session struct {
 	CreatedAt    time.Time
 	ExpiresAt    time.Time
 	Used         bool
-	Revoked      bool
+	// UsedAt is when this session's refresh credential was consumed by a
+	// rotation; it anchors the duplicate-submission grace window.
+	UsedAt  time.Time
+	Revoked bool
 }
 
 // IssueResult is returned by login and refresh.
@@ -194,18 +212,30 @@ func (s *Service) revokeChainLocked(chainID, reason string) bool {
 	return true
 }
 
+// withinRotationGrace reports whether presenting a consumed credential at
+// now is a duplicate of the just-completed rotation (concurrent submission
+// or client-timeout retry) rather than a genuine replay.
+func (s *Service) withinRotationGrace(sess *Session, now time.Time) bool {
+	return now.Before(sess.UsedAt.Add(s.opts.RotationGrace))
+}
+
 // Refresh performs a one-time rotation.
 //
 // Semantics (deterministic):
 //   - unknown credential ........... refresh_not_found
-//   - credential of revoked chain .. refresh_replayed (chain terminated)
+//   - credential of revoked chain .. refresh_replayed / refresh_revoked by cause
 //   - another refresh in flight .... concurrent_refresh (no state changes)
-//   - already-consumed credential .. refresh_replayed; whole chain revoked
+//   - consumed within grace ........ concurrent_refresh (duplicate of the
+//     just-completed rotation: concurrent submit or client retry; no state
+//     changes, the live chain is never harmed)
+//   - consumed past grace .......... refresh_replayed; whole chain revoked
 //   - expired, unconsumed .......... refresh_expired (no rotation)
 //   - otherwise .................... rotate exactly once, append one session
 //
 // Only one concurrent refresh of the same credential can succeed; losers make
-// no state change and cannot fork the chain.
+// no state change and cannot fork the chain. The verdict for re-presenting a
+// just-consumed credential does not depend on scheduling: inside the grace
+// window it is always concurrent_refresh, never replay.
 func (s *Service) Refresh(raw string, now time.Time) (*IssueResult, error) {
 	if raw == "" {
 		return nil, newError(ErrRefreshNotFound, "empty refresh credential")
@@ -237,11 +267,19 @@ func (s *Service) Refresh(raw string, now time.Time) (*IssueResult, error) {
 		return nil, newError(ErrConcurrentRefresh, "a refresh for this credential is already in progress")
 	}
 	if sess.Used {
+		if s.withinRotationGrace(sess, now) {
+			s.mu.Unlock()
+			if s.opts.Logger != nil {
+				s.opts.Logger.Printf("refresh: input=%s chain=%s => denied concurrent_refresh (duplicate of rotation completed %s ago, within grace)",
+					short(raw), sess.ChainID[:8], now.Sub(sess.UsedAt))
+			}
+			return nil, newError(ErrConcurrentRefresh, "refresh credential %s was just rotated; treating re-submission as a duplicate", short(raw))
+		}
 		s.revokeChainLocked(sess.ChainID, "replay")
 		s.mu.Unlock()
 		if s.opts.Logger != nil {
-			s.opts.Logger.Printf("refresh: input=%s chain=%s => denied refresh_replayed + chain revoked (one-time-use violation)",
-				short(raw), sess.ChainID[:8])
+			s.opts.Logger.Printf("refresh: input=%s chain=%s => denied refresh_replayed + chain revoked (one-time-use violation, %s past grace)",
+				short(raw), sess.ChainID[:8], now.Sub(sess.UsedAt))
 		}
 		return nil, newError(ErrRefreshReplayed, "refresh credential %s was already consumed; replay detected, chain terminated", short(raw))
 	}
@@ -300,6 +338,14 @@ func (s *Service) Refresh(raw string, now time.Time) (*IssueResult, error) {
 		}
 		return nil, terminatedChainError(reason, cur.ChainID)
 	case cur.Used:
+		if s.withinRotationGrace(cur, now) {
+			delete(s.inflight, raw)
+			s.mu.Unlock()
+			if s.opts.Logger != nil {
+				s.opts.Logger.Printf("refresh: input=%s => denied concurrent_refresh at commit (duplicate within grace)", short(raw))
+			}
+			return nil, newError(ErrConcurrentRefresh, "refresh credential %s was just rotated; treating re-submission as a duplicate", short(raw))
+		}
 		s.revokeChainLocked(cur.ChainID, "replay")
 		delete(s.inflight, raw)
 		s.mu.Unlock()
@@ -325,6 +371,7 @@ func (s *Service) Refresh(raw string, now time.Time) (*IssueResult, error) {
 		CreatedAt: now, ExpiresAt: now.Add(s.opts.RefreshTokenTTL),
 	}
 	cur.Used = true
+	cur.UsedAt = now
 	s.byRefresh[newRefresh] = next
 	s.chains[cur.ChainID] = append(s.chains[cur.ChainID], next)
 	delete(s.inflight, raw)

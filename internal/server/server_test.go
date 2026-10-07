@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,10 +17,29 @@ import (
 	"github.com/h3yow/identity-provider-go/internal/tokens"
 )
 
-func newTestServer(t *testing.T) (*Server, *keys.KeyRing, time.Time) {
+// testClock is a manually advanced clock so tests can move the server past
+// the duplicate-submission grace window when they mean "genuine replay".
+type testClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *testClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *testClock) Set(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = t
+}
+
+func newTestServer(t *testing.T) (*Server, *keys.KeyRing, *testClock) {
 	t.Helper()
 	t0 := time.Date(2026, 9, 25, 10, 0, 0, 0, time.UTC)
-	now := t0
+	clock := &testClock{t: t0}
 	r := keys.NewKeyRing()
 	if _, err := r.Rotate("k1", []byte("http-secret"), t0, time.Hour, 2*time.Hour); err != nil {
 		t.Fatal(err)
@@ -34,9 +54,9 @@ func newTestServer(t *testing.T) (*Server, *keys.KeyRing, time.Time) {
 	pol.Grant("editor", "read", "write")
 	srv := New(Config{
 		Auth: authn, Authz: authz.NewAuthorizer(authn, pol, logger),
-		Now: func() time.Time { return now },
+		Now:  clock.Now,
 	})
-	return srv, r, t0
+	return srv, r, clock
 }
 
 func post(t *testing.T, h http.Handler, path string, body any) (int, map[string]any) {
@@ -55,7 +75,7 @@ func post(t *testing.T, h http.Handler, path string, body any) (int, map[string]
 }
 
 func TestHTTPFullLifecycle(t *testing.T) {
-	srv, _, _ := newTestServer(t)
+	srv, _, clock := newTestServer(t)
 	h := srv.Handler()
 
 	// Login as viewer.
@@ -97,7 +117,15 @@ func TestHTTPFullLifecycle(t *testing.T) {
 		t.Fatalf("refresh status = %d", st)
 	}
 	newRefresh, _ := rot["refresh_token"].(string)
-	// Replaying the old refresh credential is 401 refresh_replayed and kills chain.
+	// A re-submission right after the rotation (inside the duplicate-submission
+	// grace window) is a stable 401 concurrent_refresh and harms nothing.
+	st, dup := post(t, h, "/refresh", map[string]any{"refresh_token": refresh})
+	if st != http.StatusUnauthorized || dup["error"] != "concurrent_refresh" {
+		t.Fatalf("in-grace duplicate => %d %v, want 401 concurrent_refresh", st, dup)
+	}
+	// Replaying the old credential well after the rotation (past the grace
+	// window) is a genuine replay: 401 refresh_replayed and the chain dies.
+	clock.Set(clock.Now().Add(time.Minute))
 	st, replay := post(t, h, "/refresh", map[string]any{"refresh_token": refresh})
 	if st != http.StatusUnauthorized || replay["error"] != "refresh_replayed" {
 		t.Fatalf("replay => %d %v, want 401 refresh_replayed", st, replay)
@@ -145,7 +173,7 @@ func TestHTTPConcurrentRefreshSingleWinner(t *testing.T) {
 			denied++
 		}
 	}
-	t.Logf("HTTP concurrent refresh: winners=%d denied=%d (all denied are 401 concurrent_refresh or replay-classified)", wins, denied)
+	t.Logf("HTTP concurrent refresh: winners=%d denied=%d (denied are stably 401 concurrent_refresh)", wins, denied)
 	if wins != 1 {
 		t.Fatalf("winners = %d, want 1", wins)
 	}
@@ -247,7 +275,8 @@ func TestHTTPSessionLimit(t *testing.T) {
 
 // Unknown vs retired vs rotated key distinctions across /verify.
 func TestHTTPKeyRotationDistinctions(t *testing.T) {
-	srv, ring, t0 := newTestServer(t)
+	srv, ring, clock := newTestServer(t)
+	t0 := clock.Now()
 	h := srv.Handler()
 	_, login := post(t, h, "/login", map[string]any{"subject": "carol"})
 	oldAccess, _ := login["access_token"].(string)

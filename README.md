@@ -63,17 +63,29 @@ CreatedAt + ExpiresAt + RetireAt` 描述，在任意时刻处于以下三态之�
 | 所属链被重放检测终止              | `refresh_replayed`    | 无       |
 | 所属链被登出/按主体终止           | `refresh_revoked`     | 无       |
 | 同一凭据已有刷新在进行中          | `concurrent_refresh`  | 无       |
-| 凭据已被消费（再次出现）          | `refresh_replayed`    | **撤销整条链** |
+| 凭据刚被消费，宽限窗口内再次出现   | `concurrent_refresh`  | 无       |
+| 凭据已被消费且已过宽限窗口（真正重放） | `refresh_replayed` | **撤销整条链** |
 | 凭据未消费但已过期                | `refresh_expired`     | 无       |
 | 正常                              | 成功，轮换恰好一次     | 追加 1 个会话 |
 
-- **重放即终止链路**：已使用过的旧凭据再次出现，判定为一次性使用违例，链上所有
-  会话标记 `Revoked`。之后链上任何凭据（包括刚轮换出的「新」凭据）再使用都得到
-  `refresh_replayed`，不会产生重复会话或状态分叉。
+- **重放即终止链路**：超过宽限窗口后，已使用过的旧凭据再次出现，判定为一次性
+  使用违例，链上所有会话标记 `Revoked`。之后链上任何凭据（包括刚轮换出的「新」
+  凭据）再使用都得到 `refresh_replayed`，不会产生重复会话或状态分叉。
 - **并发刷新只允许一个成功**：服务以全局互斥串行化状态变更，并对「正在轮换」的
   凭据维护 in-flight 预留。N 个并发请求中恰好 1 个成功，其余得到
   `concurrent_refresh` 且不改变任何状态；提交阶段会在锁内二次校验，防止准备期间
   链被其他重放终止。测试用 32/16 goroutine + `-race` 验证无分叉、无重复会话。
+- **重复提交宽限（`Options.RotationGrace`，默认 30s）**：凭据被消费的时刻记为
+  `UsedAt`；在 `UsedAt + RotationGrace` 之内再次提交**同一个**凭据，一律视为
+  「同一轮换的重复提交」——固定判定 `concurrent_refresh`，不改任何状态、绝不动链。
+  这让两类客户端行为的结论**不随时序漂移**：
+  - 同一凭据被并发提交：输家无论落在在途窗口内还是赢家提交之后，都得到
+    `concurrent_refresh`；
+  - 客户端超时后短时间重试：只要还落在宽限窗口内，结论与并发输家完全一致，
+    不会被误判成 `refresh_replayed` 而把本来活着的链提前终止。
+  超过宽限窗口再拿已轮换掉的旧凭据来用，仍然是真正的重放：`refresh_replayed`
+  并终止整条链，该能力不受宽限影响（`TestGenuineReplayStillTerminatesChain`
+  覆盖窗口 ±1s 边界）。
 
 ## 3. 会话的结束：登出与按主体终止
 
@@ -91,10 +103,14 @@ CreatedAt + ExpiresAt + RetireAt` 描述，在任意时刻处于以下三态之�
 - **按主体终止（`TerminateSubject` / `POST /terminate {subject}`）**：一次性结束该
   主体当前所有存活链，返回终止的链数；对无存活链的主体是 200 幂等空操作。
   - **与刷新的竞争是确定的**：终止与刷新提交共用同一把状态锁。终止返回后，该主体
-    名下**不可能再刷新成功**（一律 `refresh_revoked`），也**不会再冒出新会话**—
-    —在终止前已开始、但尚未提交的刷新，会在提交阶段看到链已终止而失败；在终止前
-    已提交的会话，会被终止一并撤销。无论调度如何交错，结论一致（
-    `TestTerminateSubjectRacesRefresh` 用 4 链 × 8 goroutine + `-race` 验证）。
+    名下**不可能再刷新成功**，也**不会再冒出新会话**——在终止前已开始、但尚未提交
+    的刷新，会在提交阶段看到链已终止而失败；在终止前已提交的会话，会被终止一并
+    撤销。终止之后，用该主体任意一条链上的任意凭据刷新，结论**每次都固定**为
+    `refresh_revoked`（与「凭据没出现过」的 `refresh_not_found`、与「重放」的
+    `refresh_replayed` 都可区分）：在途刷新的重复提交只会被判为宽限内的
+    `concurrent_refresh`，不会抢在终止之前把链变成 replay 状态，因此结论不被
+    调度左右（`TestTerminateSubjectRacesRefresh`、`TestTerminateVsInFlightRefreshDeterministic`
+    与 `TestTerminateRacingRetryKeepsFixedVerdict` 多轮 + `-race` 验证）。
   - 终止不封禁主体：之后重新登录会开一条全新的链，属正常行为。
 
 ## 4. 每主体活跃链上限（容量闸门）
@@ -148,6 +164,9 @@ CreatedAt + ExpiresAt + RetireAt` 描述，在任意时刻处于以下三态之�
 - 被重放检测终止的链，刷新结论保持 `refresh_replayed` 不变；只有**主动**结束
   （登出/按主体终止）的链才返回新码 `refresh_revoked` / `session_revoked`。
 - 容量闸门默认关闭（0 = 不限），不配置时行为与之前完全一致。
+- **重复提交宽限**（`Options.RotationGrace`，默认 30s）：轮换完成后立刻（宽限
+  窗口内）重试同一个旧凭据，结论由 `refresh_replayed` 变为 `concurrent_refresh`
+  （不再误杀活链）；宽限窗口之外的重放检测行为不变。
 
 ## 8. 本地验证
 
@@ -159,9 +178,14 @@ go test ./... -race -v
 go test ./internal/keys/  -v   # 轮换、active/grace/retired 三态
 go test ./internal/tokens/ -v # 多版本共存、宽限、过期/签名/未知/退役区分
 go test ./internal/auth/  -v   # 一次性轮换、重放终止链、32 并发单赢家、
-                               # 登出/按主体终止/容量闸门、终止与刷新竞争
+                               # 登出/按主体终止/容量闸门、终止与刷新竞争、
+                               # 同一凭据并发/超时重试的稳定判定
 go test ./internal/authz/ -v   # 四值判定、权限不扩散、并发稳定
 go test ./internal/server/ -v  # HTTP 端到端、401/403/409 区分、登出与终止
+
+# 并发场景专项：终止与刷新竞争、同一凭据并发/重试——重复多轮验证结论稳定
+go test ./internal/auth/ -race -count=20 -v \
+  -run 'TestTerminateSubjectRacesRefresh|TestTerminateVsInFlightRefreshDeterministic|TestSameCredentialConcurrentAndRetryStable|TestTerminateRacingRetryKeepsFixedVerdict|TestGenuineReplayStillTerminatesChain'
 
 # 启动服务并手工验证
 go run ./cmd/idp
@@ -182,7 +206,11 @@ curl -s -XPOST $BASE/authz  -d "{\"access_token\":\"$AT\",\"scopes\":[\"admin\"]
 curl -s -XPOST $BASE/authz  -d '{}'                                                  # 401 missing_token
 
 NEW=$(curl -s -XPOST $BASE/refresh -d "{\"refresh_token\":\"$RT\"}")
-curl -i -XPOST $BASE/refresh -d "{\"refresh_token\":\"$RT\"}"   # 401 refresh_replayed，链路终止
+# 宽限窗口（默认 30s）内立即重试同一凭据 = 重复提交：401 concurrent_refresh，链不受影响
+curl -i -XPOST $BASE/refresh -d "{\"refresh_token\":\"$RT\"}"
+# 超过宽限窗口再用旧凭据 = 真正重放：401 refresh_replayed，链路终止
+sleep 31
+curl -i -XPOST $BASE/refresh -d "{\"refresh_token\":\"$RT\"}"
 
 # 登出与按主体终止
 LOGIN2=$(curl -s -XPOST $BASE/login -d '{"subject":"alice"}')
